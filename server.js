@@ -10,10 +10,24 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const orders = new Map(); // demo (en producción usa BD)
+// demo (en producción usa BD)
+const orders = new Map();
 
 function newOrderId() {
   return crypto.randomUUID();
+}
+
+// --- Auth opcional para endpoints admin ---
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
+function requireAdmin(req, res, next) {
+  // Si no defines ADMIN_TOKEN, no bloquea (modo simple)
+  if (!ADMIN_TOKEN) return next();
+
+  const auth = String(req.headers.authorization || "");
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+  if (token !== ADMIN_TOKEN) return res.status(401).json({ error: "Unauthorized" });
+
+  next();
 }
 
 app.get("/health", (req, res) => res.json({ ok: true }));
@@ -21,10 +35,9 @@ app.get("/health", (req, res) => res.json({ ok: true }));
 // Tu FRONTEND (index.html) llama a este endpoint
 app.post("/create_preference", async (req, res) => {
   try {
-    // ✅ NUEVO: recibimos delivery/pickup desde el frontend
     const {
       items = [],
-      shippingOption,
+      shippingOption = "delivery",
       shippingCost = 0,
       delivery = null,
       pickup = null,
@@ -34,35 +47,33 @@ app.post("/create_preference", async (req, res) => {
       return res.status(400).json({ error: "items vacío" });
     }
 
+    if (!process.env.MP_ACCESS_TOKEN) {
+      return res.status(500).json({ error: "Falta MP_ACCESS_TOKEN en .env" });
+    }
+
     // Tu HTML envía: {title, unitprice, quantity}
     const mpItems = items.map((i) => ({
-      title: String(i.title ?? ""),
+      title: String(i.title ?? "").trim(),
       quantity: Number(i.quantity ?? 1),
       unit_price: Number(i.unitprice ?? 0),
-      // Si tu cuenta es Chile, normalmente ayuda dejar esto fijo:
       currency_id: "CLP",
     }));
 
-    if (
-      mpItems.some(
-        (i) =>
-          !i.title ||
-          !Number.isFinite(i.quantity) ||
-          i.quantity <= 0 ||
-          !Number.isFinite(i.unit_price) ||
-          i.unit_price <= 0
-      )
-    ) {
+    const invalid = mpItems.some(
+      (i) =>
+        !i.title ||
+        !Number.isFinite(i.quantity) ||
+        i.quantity <= 0 ||
+        !Number.isFinite(i.unit_price) ||
+        i.unit_price <= 0
+    );
+    if (invalid) {
       return res.status(400).json({ error: "items inválidos", mpItems });
     }
 
     // Si hay delivery, agrega el costo como “ítem”
     const shipCost = Number(shippingCost ?? 0);
-    if (
-      shippingOption === "delivery" &&
-      Number.isFinite(shipCost) &&
-      shipCost > 0
-    ) {
+    if (shippingOption === "delivery" && Number.isFinite(shipCost) && shipCost > 0) {
       mpItems.push({
         title: "Envío (Delivery)",
         quantity: 1,
@@ -73,12 +84,12 @@ app.post("/create_preference", async (req, res) => {
 
     const orderId = newOrderId();
 
-    // ✅ NUEVO: guardamos todo (incluye delivery/pickup)
+    // Guardamos todo (incluye delivery/pickup)
     orders.set(orderId, {
       status: "created",
       items: mpItems,
       shippingOption,
-      shippingCost: shipCost,
+      shippingCost: Number.isFinite(shipCost) ? shipCost : 0,
       delivery,
       pickup,
       createdAt: Date.now(),
@@ -96,10 +107,6 @@ app.post("/create_preference", async (req, res) => {
       auto_return: "approved",
     };
 
-    if (!process.env.MP_ACCESS_TOKEN) {
-      return res.status(500).json({ error: "Falta MP_ACCESS_TOKEN en .env" });
-    }
-
     const r = await axios.post(
       "https://api.mercadopago.com/checkout/preferences",
       preferenceBody,
@@ -116,7 +123,6 @@ app.post("/create_preference", async (req, res) => {
     const status = err?.response?.status || 500;
     const mpData = err?.response?.data;
 
-    // Esto es clave: acá viene el motivo real del 400/401/etc.
     console.error("MP ERROR STATUS:", status);
     console.error("MP ERROR DATA:", mpData);
 
@@ -127,14 +133,30 @@ app.post("/create_preference", async (req, res) => {
   }
 });
 
-// Para ver el estado (demo)
+// Ver 1 orden (demo)
 app.get("/order/:id", (req, res) => {
   const o = orders.get(req.params.id);
   if (!o) return res.status(404).json({ error: "Orden no encontrada" });
   res.json(o);
 });
 
-// Webhook: Mercado Pago avisa pagos; luego confirmas consultando el pago por ID
+// Listar todas (sin orderId)
+app.get("/orders", requireAdmin, (req, res) => {
+  const list = Array.from(orders.entries()).map(([id, o]) => ({ id, ...o }));
+  list.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+  res.json(list);
+});
+
+// Solo pagos aprobados (sin orderId)
+app.get("/payments", requireAdmin, (req, res) => {
+  const list = Array.from(orders.entries())
+    .map(([id, o]) => ({ id, ...o }))
+    .filter((o) => o.status === "approved")
+    .sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0));
+  res.json(list);
+});
+
+// Webhook Mercado Pago
 app.post("/webhook/mercadopago", async (req, res) => {
   try {
     // Responder rápido para que MP no reintente
@@ -145,15 +167,11 @@ app.post("/webhook/mercadopago", async (req, res) => {
 
     if (!id) return;
     if (topic && topic !== "payment") return;
-
     if (!process.env.MP_ACCESS_TOKEN) return;
 
-    const pay = await axios.get(
-      `https://api.mercadopago.com/v1/payments/${id}`,
-      {
-        headers: { Authorization: `Bearer ${process.env.MP_ACCESS_TOKEN}` },
-      }
-    );
+    const pay = await axios.get(`https://api.mercadopago.com/v1/payments/${id}`, {
+      headers: { Authorization: `Bearer ${process.env.MP_ACCESS_TOKEN}` },
+    });
 
     const payment = pay.data;
     const orderId = payment.external_reference;
@@ -165,14 +183,14 @@ app.post("/webhook/mercadopago", async (req, res) => {
       ...old,
       status: payment.status, // approved / rejected / pending, etc.
       paymentId: payment.id,
+      paymentStatusDetail: payment.status_detail,
       updatedAt: Date.now(),
     });
   } catch (e) {
-    // ya se respondió 200, solo log
-    console.error("Webhook error:", e?.message ?? e);
+    console.error("Webhook error:", e?.response?.data || e?.message || e);
   }
 });
 
-app.listen(process.env.PORT || 8080, () =>
-  console.log("Backend listo en 8080")
-);
+app.listen(process.env.PORT || 8080, () => {
+  console.log("Backend listo en 8080");
+});
