@@ -21,7 +21,14 @@ app.get("/health", (req, res) => res.json({ ok: true }));
 // Tu FRONTEND (index.html) llama a este endpoint
 app.post("/create_preference", async (req, res) => {
   try {
-    const { items = [], shippingOption, shippingCost = 0 } = req.body ?? {};
+    // ✅ NUEVO: recibimos delivery/pickup desde el frontend
+    const {
+      items = [],
+      shippingOption,
+      shippingCost = 0,
+      delivery = null,
+      pickup = null,
+    } = req.body ?? {};
 
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ error: "items vacío" });
@@ -51,7 +58,11 @@ app.post("/create_preference", async (req, res) => {
 
     // Si hay delivery, agrega el costo como “ítem”
     const shipCost = Number(shippingCost ?? 0);
-    if (shippingOption === "delivery" && Number.isFinite(shipCost) && shipCost > 0) {
+    if (
+      shippingOption === "delivery" &&
+      Number.isFinite(shipCost) &&
+      shipCost > 0
+    ) {
       mpItems.push({
         title: "Envío (Delivery)",
         quantity: 1,
@@ -61,7 +72,17 @@ app.post("/create_preference", async (req, res) => {
     }
 
     const orderId = newOrderId();
-    orders.set(orderId, { status: "created", items: mpItems, createdAt: Date.now() });
+
+    // ✅ NUEVO: guardamos todo (incluye delivery/pickup)
+    orders.set(orderId, {
+      status: "created",
+      items: mpItems,
+      shippingOption,
+      shippingCost: shipCost,
+      delivery,
+      pickup,
+      createdAt: Date.now(),
+    });
 
     const preferenceBody = {
       items: mpItems,
@@ -86,7 +107,11 @@ app.post("/create_preference", async (req, res) => {
     );
 
     // init_point es el link de pago, tu frontend espera "initpoint"
-    return res.json({ initpoint: r.data.init_point, orderId, preferenceId: r.data.id });
+    return res.json({
+      initpoint: r.data.init_point,
+      orderId,
+      preferenceId: r.data.id,
+    });
   } catch (err) {
     const status = err?.response?.status || 500;
     const mpData = err?.response?.data;
@@ -123,9 +148,12 @@ app.post("/webhook/mercadopago", async (req, res) => {
 
     if (!process.env.MP_ACCESS_TOKEN) return;
 
-    const pay = await axios.get(`https://api.mercadopago.com/v1/payments/${id}`, {
-      headers: { Authorization: `Bearer ${process.env.MP_ACCESS_TOKEN}` },
-    });
+    const pay = await axios.get(
+      `https://api.mercadopago.com/v1/payments/${id}`,
+      {
+        headers: { Authorization: `Bearer ${process.env.MP_ACCESS_TOKEN}` },
+      }
+    );
 
     const payment = pay.data;
     const orderId = payment.external_reference;
@@ -145,4 +173,6 @@ app.post("/webhook/mercadopago", async (req, res) => {
   }
 });
 
-app.listen(process.env.PORT || 8080, () => console.log("Backend listo en 8080"));
+app.listen(process.env.PORT || 8080, () =>
+  console.log("Backend listo en 8080")
+);
