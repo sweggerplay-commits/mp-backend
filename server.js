@@ -67,6 +67,7 @@ app.post("/create_preference", async (req, res) => {
         !Number.isFinite(i.unit_price) ||
         i.unit_price <= 0
     );
+
     if (invalid) {
       return res.status(400).json({ error: "items inválidos", mpItems });
     }
@@ -84,6 +85,8 @@ app.post("/create_preference", async (req, res) => {
 
     const orderId = newOrderId();
 
+    const now = Date.now();
+
     // Guardamos todo (incluye delivery/pickup)
     orders.set(orderId, {
       status: "created",
@@ -92,7 +95,8 @@ app.post("/create_preference", async (req, res) => {
       shippingCost: Number.isFinite(shipCost) ? shipCost : 0,
       delivery,
       pickup,
-      createdAt: Date.now(),
+      createdAt: now,
+      updatedAt: now, // mejora: para que no salga "-" al inicio
     });
 
     const preferenceBody = {
@@ -123,8 +127,7 @@ app.post("/create_preference", async (req, res) => {
     const status = err?.response?.status || 500;
     const mpData = err?.response?.data;
 
-    console.error("MP ERROR STATUS:", status);
-    console.error("MP ERROR DATA:", mpData);
+    console.error("create_preference error:", status, mpData || err?.message || err);
 
     return res.status(status).json({
       error: "No se pudo crear preferencia",
@@ -189,6 +192,188 @@ app.post("/webhook/mercadopago", async (req, res) => {
   } catch (e) {
     console.error("Webhook error:", e?.response?.data || e?.message || e);
   }
+});
+
+/**
+ * ----------- VISTA HTML (más simple + hora compra) -----------
+ */
+function formatCLDateTime(ms) {
+  if (!ms) return "-";
+  return new Date(ms).toLocaleString("es-CL", {
+    timeZone: "America/Santiago",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+function formatCLP(n) {
+  return Number(n || 0).toLocaleString("es-CL");
+}
+
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    "\"": "&quot;",
+    "'": "&#39;", // FIX: antes estabas devolviendo "'" (no escapaba)
+  }[c]));
+}
+
+function calcTotal(items = []) {
+  return items.reduce(
+    (sum, it) => sum + (Number(it.unit_price || 0) * Number(it.quantity || 0)),
+    0
+  );
+}
+
+app.get("/orders/view", requireAdmin, (req, res) => {
+  const list = Array.from(orders.entries())
+    .map(([id, o]) => ({ id, ...o }))
+    .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+
+  const rows = list.map((o) => {
+    const firstItem = o.items?.[0];
+    const cliente =
+      o.shippingOption === "pickup" ? (o.pickup?.name || "-") : (o.delivery?.name || "-");
+    const telefono =
+      o.shippingOption === "pickup" ? (o.pickup?.phone || "-") : (o.delivery?.phone || "-");
+
+    return `
+      <tr>
+        <td style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace;">${esc(o.id)}</td>
+        <td>${esc(o.status || "-")}</td>
+        <td>${esc(o.shippingOption || "-")}</td>
+        <td>${esc(cliente)}</td>
+        <td>${esc(telefono)}</td>
+        <td>${esc(firstItem?.title || "-")}</td>
+        <td style="text-align:right;">$${formatCLP(calcTotal(o.items))}</td>
+        <td>${esc(formatCLDateTime(o.createdAt))}</td>
+        <td>${esc(formatCLDateTime(o.updatedAt))}</td>
+      </tr>
+    `;
+  }).join("");
+
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.end(`
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Órdenes</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#0b1220;color:#e5e7eb;margin:0;padding:18px}
+    h1{margin:0 0 12px;font-size:20px}
+    .card{background:#111827;border:1px solid #1f2937;border-radius:12px;padding:14px}
+    table{width:100%;border-collapse:collapse;font-size:13px}
+    th,td{border-bottom:1px solid #1f2937;padding:10px;vertical-align:top}
+    th{color:#93c5fd;text-align:left;font-weight:700;white-space:nowrap}
+    tr:hover td{background:#0f172a}
+    .muted{color:#9ca3af;font-size:12px;margin-top:10px}
+  </style>
+</head>
+<body>
+  <h1>Órdenes (últimas primero)</h1>
+  <div class="card">
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Estado</th>
+          <th>Tipo</th>
+          <th>Cliente</th>
+          <th>Teléfono</th>
+          <th>Primer ítem</th>
+          <th>Total</th>
+          <th>Creada</th>
+          <th>Actualizada</th>
+        </tr>
+      </thead>
+      <tbody>${rows || `<tr><td colspan="9">No hay órdenes.</td></tr>`}</tbody>
+    </table>
+    <div class="muted">Hora mostrada en America/Santiago.</div>
+  </div>
+</body>
+</html>
+  `);
+});
+
+app.get("/payments/view", requireAdmin, (req, res) => {
+  const list = Array.from(orders.entries())
+    .map(([id, o]) => ({ id, ...o }))
+    .filter((o) => o.status === "approved")
+    .sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0));
+
+  const rows = list.map((o) => {
+    const firstItem = o.items?.[0];
+    const cliente =
+      o.shippingOption === "pickup" ? (o.pickup?.name || "-") : (o.delivery?.name || "-");
+    const telefono =
+      o.shippingOption === "pickup" ? (o.pickup?.phone || "-") : (o.delivery?.phone || "-");
+
+    return `
+      <tr>
+        <td style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace;">${esc(o.id)}</td>
+        <td>${esc(o.status || "-")}</td>
+        <td>${esc(o.shippingOption || "-")}</td>
+        <td>${esc(cliente)}</td>
+        <td>${esc(telefono)}</td>
+        <td>${esc(firstItem?.title || "-")}</td>
+        <td style="text-align:right;">$${formatCLP(calcTotal(o.items))}</td>
+        <td>${esc(formatCLDateTime(o.createdAt))}</td>
+        <td>${esc(formatCLDateTime(o.updatedAt))}</td>
+      </tr>
+    `;
+  }).join("");
+
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.end(`
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Pagos aprobados</title>
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#0b1220;color:#e5e7eb;margin:0;padding:18px}
+    h1{margin:0 0 12px;font-size:20px}
+    .card{background:#111827;border:1px solid #1f2937;border-radius:12px;padding:14px}
+    table{width:100%;border-collapse:collapse;font-size:13px}
+    th,td{border-bottom:1px solid #1f2937;padding:10px;vertical-align:top}
+    th{color:#86efac;text-align:left;font-weight:700;white-space:nowrap}
+    tr:hover td{background:#0f172a}
+    .muted{color:#9ca3af;font-size:12px;margin-top:10px}
+  </style>
+</head>
+<body>
+  <h1>Pagos aprobados</h1>
+  <div class="card">
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>Estado</th>
+          <th>Tipo</th>
+          <th>Cliente</th>
+          <th>Teléfono</th>
+          <th>Primer ítem</th>
+          <th>Total</th>
+          <th>Creada</th>
+          <th>Actualizada</th>
+        </tr>
+      </thead>
+      <tbody>${rows || `<tr><td colspan="9">No hay pagos aprobados.</td></tr>`}</tbody>
+    </table>
+    <div class="muted">Hora mostrada en America/Santiago.</div>
+  </div>
+</body>
+</html>
+  `);
 });
 
 app.listen(process.env.PORT || 8080, () => {
