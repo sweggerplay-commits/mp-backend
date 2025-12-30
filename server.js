@@ -19,6 +19,7 @@ function newOrderId() {
 
 // --- Auth opcional para endpoints admin ---
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "";
+
 function requireAdmin(req, res, next) {
   // Si no defines ADMIN_TOKEN, no bloquea (modo simple)
   if (!ADMIN_TOKEN) return next();
@@ -32,7 +33,59 @@ function requireAdmin(req, res, next) {
 
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-// Tu FRONTEND (index.html) llama a este endpoint
+/**
+ * -------------------------
+ * Helpers detalle (JSON)
+ * -------------------------
+ */
+function normalizeCommuneLabel(commune) {
+  const c = String(commune || "").trim().toLowerCase();
+  if (!c) return "";
+  if (c === "la-serena" || c === "laserena" || c === "la serena") return "La Serena";
+  if (c === "coquimbo") return "Coquimbo";
+  return String(commune);
+}
+
+function buildDetailObject(o) {
+  const type = o?.shippingOption === "pickup" ? "pickup" : "delivery";
+
+  if (type === "delivery") {
+    const name = String(o?.delivery?.name || "");
+    const phone = String(o?.delivery?.phone || "");
+    const address = String(o?.delivery?.address || "");
+    const commune = normalizeCommuneLabel(o?.delivery?.commune || "");
+    const notes = String(o?.delivery?.notes || "");
+    return { type, name, phone, address, commune, notes, rut: "" };
+  }
+
+  // pickup
+  const name = String(o?.pickup?.name || "");
+  const phone = String(o?.pickup?.phone || "");
+  const rut = String(o?.pickup?.rut || "");
+  return { type, name, phone, address: "", commune: "", notes: "", rut };
+}
+
+function buildDetailText(o) {
+  const d = buildDetailObject(o);
+
+  if (d.type === "delivery") {
+    const parts = [];
+    if (d.address) parts.push(d.address);
+    if (d.commune) parts.push(d.commune);
+    const base = parts.length ? parts.join(", ") : "-";
+    return d.notes ? `Delivery: ${base}. Notas: ${d.notes}` : `Delivery: ${base}`;
+  }
+
+  // pickup
+  return d.rut ? `Retiro en tienda. RUT: ${d.rut}` : "Retiro en tienda.";
+}
+
+/**
+ * -------------------------
+ * MercadoPago - Crear preferencia
+ * -------------------------
+ * Tu FRONTEND (index.html) llama a este endpoint
+ */
 app.post("/create_preference", async (req, res) => {
   try {
     const {
@@ -84,7 +137,6 @@ app.post("/create_preference", async (req, res) => {
     }
 
     const orderId = newOrderId();
-
     const now = Date.now();
 
     // Guardamos todo (incluye delivery/pickup)
@@ -96,7 +148,7 @@ app.post("/create_preference", async (req, res) => {
       delivery,
       pickup,
       createdAt: now,
-      updatedAt: now, // mejora: para que no salga "-" al inicio
+      updatedAt: now,
     });
 
     const preferenceBody = {
@@ -126,9 +178,7 @@ app.post("/create_preference", async (req, res) => {
   } catch (err) {
     const status = err?.response?.status || 500;
     const mpData = err?.response?.data;
-
     console.error("create_preference error:", status, mpData || err?.message || err);
-
     return res.status(status).json({
       error: "No se pudo crear preferencia",
       detail: mpData || String(err?.message ?? err),
@@ -136,16 +186,31 @@ app.post("/create_preference", async (req, res) => {
   }
 });
 
+/**
+ * -------------------------
+ * Endpoints JSON (con detail + detailText)
+ * -------------------------
+ */
+
 // Ver 1 orden (demo)
 app.get("/order/:id", (req, res) => {
   const o = orders.get(req.params.id);
   if (!o) return res.status(404).json({ error: "Orden no encontrada" });
-  res.json(o);
+
+  const detail = buildDetailObject(o);
+  const detailText = buildDetailText(o);
+
+  res.json({ ...o, detail, detailText });
 });
 
 // Listar todas (sin orderId)
 app.get("/orders", requireAdmin, (req, res) => {
-  const list = Array.from(orders.entries()).map(([id, o]) => ({ id, ...o }));
+  const list = Array.from(orders.entries()).map(([id, o]) => {
+    const detail = buildDetailObject(o);
+    const detailText = buildDetailText(o);
+    return { id, ...o, detail, detailText };
+  });
+
   list.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
   res.json(list);
 });
@@ -153,13 +218,22 @@ app.get("/orders", requireAdmin, (req, res) => {
 // Solo pagos aprobados (sin orderId)
 app.get("/payments", requireAdmin, (req, res) => {
   const list = Array.from(orders.entries())
-    .map(([id, o]) => ({ id, ...o }))
+    .map(([id, o]) => {
+      const detail = buildDetailObject(o);
+      const detailText = buildDetailText(o);
+      return { id, ...o, detail, detailText };
+    })
     .filter((o) => o.status === "approved")
     .sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0));
+
   res.json(list);
 });
 
-// Webhook Mercado Pago
+/**
+ * -------------------------
+ * Webhook Mercado Pago
+ * -------------------------
+ */
 app.post("/webhook/mercadopago", async (req, res) => {
   try {
     // Responder rápido para que MP no reintente
@@ -167,8 +241,8 @@ app.post("/webhook/mercadopago", async (req, res) => {
 
     const topic = req.query.topic || req.query.type;
     const id = req.query.id || req.body?.data?.id;
-
     if (!id) return;
+
     if (topic && topic !== "payment") return;
     if (!process.env.MP_ACCESS_TOKEN) return;
 
@@ -195,7 +269,9 @@ app.post("/webhook/mercadopago", async (req, res) => {
 });
 
 /**
- * ----------- VISTA HTML (más simple + hora compra) -----------
+ * -------------------------
+ * Vista HTML Admin
+ * -------------------------
  */
 function formatCLDateTime(ms) {
   if (!ms) return "-";
@@ -214,71 +290,62 @@ function formatCLP(n) {
   return Number(n || 0).toLocaleString("es-CL");
 }
 
+// Escape HTML correcto
 function esc(s) {
-  return String(s ?? "").replace(/[&<>"']/g, (c) => ({
+  return String(s ?? "").replace(/[&<>\"']/g, (c) => ({
     "&": "&amp;",
     "<": "&lt;",
     ">": "&gt;",
     "\"": "&quot;",
-    "'": "&#39;", // FIX: antes estabas devolviendo "'" (no escapaba)
+    "'": "&#39;",
   }[c]));
 }
 
 function calcTotal(items = []) {
   return items.reduce(
-    (sum, it) => sum + (Number(it.unit_price || 0) * Number(it.quantity || 0)),
+    (sum, it) => sum + Number(it.unit_price || 0) * Number(it.quantity || 0),
     0
   );
 }
 
-app.get("/orders/view", requireAdmin, (req, res) => {
-  const list = Array.from(orders.entries())
-    .map(([id, o]) => ({ id, ...o }))
-    .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+function buildDetailHtml(o) {
+  const d = buildDetailObject(o);
 
-  const rows = list.map((o) => {
-    const firstItem = o.items?.[0];
-    const cliente =
-      o.shippingOption === "pickup" ? (o.pickup?.name || "-") : (o.delivery?.name || "-");
-    const telefono =
-      o.shippingOption === "pickup" ? (o.pickup?.phone || "-") : (o.delivery?.phone || "-");
-
+  if (d.type === "delivery") {
+    const notesHtml = d.notes ? `<div class="muted">Notas: ${esc(d.notes)}</div>` : "";
     return `
-      <tr>
-        <td style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace;">${esc(o.id)}</td>
-        <td>${esc(o.status || "-")}</td>
-        <td>${esc(o.shippingOption || "-")}</td>
-        <td>${esc(cliente)}</td>
-        <td>${esc(telefono)}</td>
-        <td>${esc(firstItem?.title || "-")}</td>
-        <td style="text-align:right;">$${formatCLP(calcTotal(o.items))}</td>
-        <td>${esc(formatCLDateTime(o.createdAt))}</td>
-        <td>${esc(formatCLDateTime(o.updatedAt))}</td>
-      </tr>
+      <div><strong>Dirección:</strong> ${esc(d.address || "-")}</div>
+      <div><strong>Comuna:</strong> ${esc(d.commune || "-")}</div>
+      ${notesHtml}
     `;
-  }).join("");
+  }
 
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.end(`
-<!doctype html>
+  return d.rut ? `<div><strong>RUT:</strong> ${esc(d.rut)}</div>` : `<span class="muted">-</span>`;
+}
+
+function renderTablePage({ title, headerColor, rowsHtml }) {
+  return `<!doctype html>
 <html lang="es">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Órdenes</title>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>${esc(title)}</title>
   <style>
     body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#0b1220;color:#e5e7eb;margin:0;padding:18px}
     h1{margin:0 0 12px;font-size:20px}
     .card{background:#111827;border:1px solid #1f2937;border-radius:12px;padding:14px}
     table{width:100%;border-collapse:collapse;font-size:13px}
     th,td{border-bottom:1px solid #1f2937;padding:10px;vertical-align:top}
-    th{color:#93c5fd;text-align:left;font-weight:700;white-space:nowrap}
+    th{color:${headerColor};text-align:left;font-weight:700;white-space:nowrap}
     tr:hover td{background:#0f172a}
-    .muted{color:#9ca3af;font-size:12px;margin-top:10px}
+    .muted{color:#9ca3af;font-size:12px}
+    .mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
+    .right{text-align:right;white-space:nowrap}
+    .nowrap{white-space:nowrap}
   </style>
 </head>
 <body>
-  <h1>Órdenes (últimas primero)</h1>
+  <h1>${esc(title)}</h1>
   <div class="card">
     <table>
       <thead>
@@ -288,19 +355,62 @@ app.get("/orders/view", requireAdmin, (req, res) => {
           <th>Tipo</th>
           <th>Cliente</th>
           <th>Teléfono</th>
+          <th>Detalle</th>
           <th>Primer ítem</th>
           <th>Total</th>
           <th>Creada</th>
           <th>Actualizada</th>
         </tr>
       </thead>
-      <tbody>${rows || `<tr><td colspan="9">No hay órdenes.</td></tr>`}</tbody>
+      <tbody>
+        ${rowsHtml || `<tr><td colspan="10" class="muted">No hay registros.</td></tr>`}
+      </tbody>
     </table>
-    <div class="muted">Hora mostrada en America/Santiago.</div>
+    <div class="muted" style="margin-top:10px;">Hora mostrada en America/Santiago.</div>
   </div>
 </body>
-</html>
-  `);
+</html>`;
+}
+
+app.get("/orders/view", requireAdmin, (req, res) => {
+  const list = Array.from(orders.entries())
+    .map(([id, o]) => ({ id, ...o }))
+    .sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+
+  const rowsHtml = list
+    .map((o) => {
+      const firstItem = o.items?.[0];
+      const cliente =
+        o.shippingOption === "pickup"
+          ? (o.pickup?.name || "-")
+          : (o.delivery?.name || "-");
+
+      const telefono =
+        o.shippingOption === "pickup"
+          ? (o.pickup?.phone || "-")
+          : (o.delivery?.phone || "-");
+
+      const detailHtml = buildDetailHtml(o);
+
+      return `
+        <tr>
+          <td class="mono">${esc(o.id)}</td>
+          <td>${esc(o.status || "-")}</td>
+          <td class="nowrap">${esc(o.shippingOption || "-")}</td>
+          <td>${esc(cliente)}</td>
+          <td class="nowrap">${esc(telefono)}</td>
+          <td>${detailHtml}</td>
+          <td>${esc(firstItem?.title || "-")}</td>
+          <td class="right">$${formatCLP(calcTotal(o.items))}</td>
+          <td class="nowrap">${esc(formatCLDateTime(o.createdAt))}</td>
+          <td class="nowrap">${esc(formatCLDateTime(o.updatedAt))}</td>
+        </tr>
+      `;
+    })
+    .join("");
+
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.end(renderTablePage({ title: "Órdenes (últimas primero)", headerColor: "#93c5fd", rowsHtml }));
 });
 
 app.get("/payments/view", requireAdmin, (req, res) => {
@@ -309,73 +419,42 @@ app.get("/payments/view", requireAdmin, (req, res) => {
     .filter((o) => o.status === "approved")
     .sort((a, b) => (b.updatedAt || b.createdAt || 0) - (a.updatedAt || a.createdAt || 0));
 
-  const rows = list.map((o) => {
-    const firstItem = o.items?.[0];
-    const cliente =
-      o.shippingOption === "pickup" ? (o.pickup?.name || "-") : (o.delivery?.name || "-");
-    const telefono =
-      o.shippingOption === "pickup" ? (o.pickup?.phone || "-") : (o.delivery?.phone || "-");
+  const rowsHtml = list
+    .map((o) => {
+      const firstItem = o.items?.[0];
+      const cliente =
+        o.shippingOption === "pickup"
+          ? (o.pickup?.name || "-")
+          : (o.delivery?.name || "-");
 
-    return `
-      <tr>
-        <td style="font-family:ui-monospace, SFMono-Regular, Menlo, monospace;">${esc(o.id)}</td>
-        <td>${esc(o.status || "-")}</td>
-        <td>${esc(o.shippingOption || "-")}</td>
-        <td>${esc(cliente)}</td>
-        <td>${esc(telefono)}</td>
-        <td>${esc(firstItem?.title || "-")}</td>
-        <td style="text-align:right;">$${formatCLP(calcTotal(o.items))}</td>
-        <td>${esc(formatCLDateTime(o.createdAt))}</td>
-        <td>${esc(formatCLDateTime(o.updatedAt))}</td>
-      </tr>
-    `;
-  }).join("");
+      const telefono =
+        o.shippingOption === "pickup"
+          ? (o.pickup?.phone || "-")
+          : (o.delivery?.phone || "-");
+
+      const detailHtml = buildDetailHtml(o);
+
+      return `
+        <tr>
+          <td class="mono">${esc(o.id)}</td>
+          <td>${esc(o.status || "-")}</td>
+          <td class="nowrap">${esc(o.shippingOption || "-")}</td>
+          <td>${esc(cliente)}</td>
+          <td class="nowrap">${esc(telefono)}</td>
+          <td>${detailHtml}</td>
+          <td>${esc(firstItem?.title || "-")}</td>
+          <td class="right">$${formatCLP(calcTotal(o.items))}</td>
+          <td class="nowrap">${esc(formatCLDateTime(o.createdAt))}</td>
+          <td class="nowrap">${esc(formatCLDateTime(o.updatedAt))}</td>
+        </tr>
+      `;
+    })
+    .join("");
 
   res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.end(`
-<!doctype html>
-<html lang="es">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Pagos aprobados</title>
-  <style>
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#0b1220;color:#e5e7eb;margin:0;padding:18px}
-    h1{margin:0 0 12px;font-size:20px}
-    .card{background:#111827;border:1px solid #1f2937;border-radius:12px;padding:14px}
-    table{width:100%;border-collapse:collapse;font-size:13px}
-    th,td{border-bottom:1px solid #1f2937;padding:10px;vertical-align:top}
-    th{color:#86efac;text-align:left;font-weight:700;white-space:nowrap}
-    tr:hover td{background:#0f172a}
-    .muted{color:#9ca3af;font-size:12px;margin-top:10px}
-  </style>
-</head>
-<body>
-  <h1>Pagos aprobados</h1>
-  <div class="card">
-    <table>
-      <thead>
-        <tr>
-          <th>ID</th>
-          <th>Estado</th>
-          <th>Tipo</th>
-          <th>Cliente</th>
-          <th>Teléfono</th>
-          <th>Primer ítem</th>
-          <th>Total</th>
-          <th>Creada</th>
-          <th>Actualizada</th>
-        </tr>
-      </thead>
-      <tbody>${rows || `<tr><td colspan="9">No hay pagos aprobados.</td></tr>`}</tbody>
-    </table>
-    <div class="muted">Hora mostrada en America/Santiago.</div>
-  </div>
-</body>
-</html>
-  `);
+  res.end(renderTablePage({ title: "Pagos aprobados", headerColor: "#86efac", rowsHtml }));
 });
 
 app.listen(process.env.PORT || 8080, () => {
-  console.log("Backend listo en 8080");
+  console.log("Backend listo en", process.env.PORT || 8080);
 });
